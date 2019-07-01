@@ -59,10 +59,9 @@ class IStack(IBase):
     """
     A suspendable coroutine runner with pluggable actions.
 
-    A coroutine will be run until a yield point. The tuple yielded will
-    be used to find the action to run from the supplied actions. The
-    action can suspend again, returning control to the runner. This
-    allows usage as an intercept upon another event loop.
+    A single coroutine will be run with a stack that contains the
+    running coroutines. They can append to the stack to wait for it
+    with a lower stack size to overcome the recursion limit.
     """
 
     _reserved = ("stack_add",)
@@ -121,6 +120,14 @@ class IStack(IBase):
 
 
 class IRotator(IBase):
+    """
+    A suspendable coroutine rotator with pluggable actions.
+
+    Multiple coroutines can be run cooperatively using dictionaries
+    containing their info. They can suspend for other coroutines,
+    create a new coroutine that will be run with it, and check on
+    other coroutines' info.
+    """
 
     _reserved = (
         "new_coro",
@@ -147,10 +154,6 @@ class IRotator(IBase):
             nonlocal active
             active = False
 
-        def _pull_suspend():
-            _suspend()
-            _pull_active()
-
         def _check_info(info):
             if not isinstance(info, dict):
                 raise TypeError("Coro info not a dict")
@@ -161,6 +164,7 @@ class IRotator(IBase):
             info_setdefault("exc", None)
             info_setdefault("active", True)
             info_setdefault("terminated", False)
+            info_setdefault("waiting_coros", [])
 
         def _new_coro_adder():
             id_ = 0
@@ -183,7 +187,7 @@ class IRotator(IBase):
         async def wait_coro(info, /):
             if not info["terminated"]:
                 info["waiting_coros"].append(cinfo)
-                _pull_suspend()
+                _suspend()
 
         async def this_id():
             return cid
@@ -212,23 +216,11 @@ class IRotator(IBase):
                 try:
                     _check_info(cinfo)
                     active = cinfo["active"]
-                    if active:
-                        print(f"run {cid=}")
                     while active and cinfo["active"]:
                         if exc := cinfo["exc"]:
                             req = cinfo["coro"].throw(exc)
                         else:
                             req = cinfo["coro"].send(cinfo["val"])
-                        if True:
-                            call = ", ".join(map(repr, req[1]))
-                            kwargs = ", ".join(
-                                f"{k}={v!r}"
-                                for k, v in req[2].items()
-                            )
-                            if kwargs:
-                                call += ", "
-                                call += kwargs
-                            print(f"  {req[0]}({call})")
                         try:
                             cinfo["val"] = await get_action(*req)
                             cinfo["exc"] = None
@@ -240,10 +232,8 @@ class IRotator(IBase):
                     cinfo["active"] = False
                     cinfo["terminated"] = True
                     if isinstance(e, StopIteration):
-                        print(f"  return {e.value!r}")
                         cinfo["val"], cinfo["exc"] = e.value, None
                     else:
-                        print(f"  raise {e!r}")
                         cinfo["val"], cinfo["exc"] = None, e
                     for info in cinfo["waiting_coros"]:
                         if not info["terminated"]:
